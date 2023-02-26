@@ -90,17 +90,35 @@ async fn expand_shrink_selection() -> anyhow::Result<()> {
         // shrink with no expansion history defaults to first child
         (
             helpers::platform_line(indoc! {r##"
+                #[(
+                    Some(thing),
+                    Some(other_thing),
+                )|]#
+            "##}),
+            "<A-i>",
+            helpers::platform_line(indoc! {r##"
                 (
                     #[Some(thing)|]#,
                     Some(other_thing),
                 )
             "##}),
-            "<A-i>",
+        ),
+        // any movement cancels selection history and falls back to first child
+        (
             helpers::platform_line(indoc! {r##"
                 (
-                    #[Some|]#(thing),
+                    Some(#[thing|]#),
+                    Some(#(other_thing|)#),
+                )
+
+            "##}),
+            "<A-o><A-o><A-o>jkvkkk<A-i>",
+            helpers::platform_line(indoc! {r##"
+                (
+                    #[|Some(thing)]#,
                     Some(other_thing),
                 )
+
             "##}),
         ),
     ];
