@@ -38,6 +38,7 @@ use helix_view::{
     info::Info,
     input::KeyEvent,
     keyboard::KeyCode,
+    register::Registers,
     tree,
     view::View,
     Document, DocumentId, Editor, ViewId,
@@ -84,6 +85,7 @@ pub struct Context<'a> {
     pub register: Option<char>,
     pub count: Option<NonZeroUsize>,
     pub editor: &'a mut Editor,
+    pub registers: &'a mut Registers,
 
     pub callback: Option<crate::compositor::Callback>,
     pub on_next_key_callback: Option<OnKeyCallback>,
@@ -197,6 +199,7 @@ impl MappableCommand {
                 if let Some(command) = typed::TYPABLE_COMMAND_MAP.get(name.as_str()) {
                     let mut cx = compositor::Context {
                         editor: cx.editor,
+                        registers: cx.registers,
                         jobs: cx.jobs,
                         scroll: None,
                     };
@@ -1839,11 +1842,13 @@ fn search_impl(
 
 fn search_completions(cx: &mut Context, reg: Option<char>) -> Vec<String> {
     let mut items = reg
-        .and_then(|reg| cx.editor.registers.get(reg))
-        .map_or(Vec::new(), |reg| reg.read().iter().take(200).collect());
+        .and_then(|reg| cx.registers.read(reg, cx.editor))
+        .map_or(Vec::new(), |contents| {
+            contents.iter().take(200).cloned().collect()
+        });
     items.sort_unstable();
     items.dedup();
-    items.into_iter().cloned().collect()
+    items.into_iter().collect()
 }
 
 fn search(cx: &mut Context) {
@@ -1902,9 +1907,8 @@ fn search_next_or_prev_impl(cx: &mut Context, movement: Movement, direction: Dir
     let count = cx.count();
     let config = cx.editor.config();
     let scrolloff = config.scrolloff;
-    let (_, doc) = current!(cx.editor);
-    let registers = &cx.editor.registers;
-    if let Some(query) = registers.read('/').and_then(|query| query.last()) {
+    if let Some(query) = cx.registers.last('/', cx.editor) {
+        let doc = doc!(cx.editor);
         let contents = doc.text().slice(..).to_string();
         let search_config = &config.search;
         let case_insensitive = if search_config.smart_case {
@@ -1913,7 +1917,7 @@ fn search_next_or_prev_impl(cx: &mut Context, movement: Movement, direction: Dir
             false
         };
         let wrap_around = search_config.wrap_around;
-        if let Ok(regex) = RegexBuilder::new(query)
+        if let Ok(regex) = RegexBuilder::new(&query)
             .case_insensitive(case_insensitive)
             .multi_line(true)
             .build()
@@ -1966,12 +1970,14 @@ fn search_selection(cx: &mut Context) {
         .join("|");
 
     let msg = format!("register '{}' set to '{}'", '/', &regex);
-    cx.editor.registers.push('/', regex);
-    cx.editor.set_status(msg);
+    match cx.registers.push('/', cx.editor, regex) {
+        Ok(_) => cx.editor.set_status(msg),
+        Err(err) => cx.editor.set_error(err.to_string()),
+    }
 }
 
 fn make_search_word_bounded(cx: &mut Context) {
-    let regex = match cx.editor.registers.last('/') {
+    let regex = match cx.registers.last('/', cx.editor) {
         Some(regex) => regex,
         None => return,
     };
@@ -1989,14 +1995,16 @@ fn make_search_word_bounded(cx: &mut Context) {
     if !start_anchored {
         new_regex.push_str("\\b");
     }
-    new_regex.push_str(regex);
+    new_regex.push_str(&regex);
     if !end_anchored {
         new_regex.push_str("\\b");
     }
 
     let msg = format!("register '{}' set to '{}'", '/', &new_regex);
-    cx.editor.registers.push('/', new_regex);
-    cx.editor.set_status(msg);
+    match cx.registers.push('/', cx.editor, regex) {
+        Ok(_) => cx.editor.set_status(msg),
+        Err(err) => cx.editor.set_error(err.to_string()),
+    }
 }
 
 fn global_search(cx: &mut Context) {
@@ -2306,21 +2314,26 @@ enum Operation {
 }
 
 fn delete_selection_impl(cx: &mut Context, op: Operation) {
-    let (view, doc) = current!(cx.editor);
+    let (view, doc) = current_ref!(cx.editor);
 
-    let selection = doc.selection(view.id);
+    let selection = doc.selection(view.id).clone();
 
     if cx.register != Some('_') {
         // first yank the selection
         let text = doc.text().slice(..);
         let values: Vec<String> = selection.fragments(text).map(Cow::into_owned).collect();
         let reg_name = cx.register.unwrap_or('"');
-        cx.editor.registers.write(reg_name, values);
+        if let Err(err) = cx.registers.write(reg_name, cx.editor, values) {
+            cx.editor.set_error(err.to_string());
+        }
     };
 
+    let (view, doc) = current!(cx.editor);
+
     // then delete
-    let transaction =
-        Transaction::delete_by_selection(doc.text(), selection, |range| (range.from(), range.to()));
+    let transaction = Transaction::delete_by_selection(doc.text(), &selection, |range| {
+        (range.from(), range.to())
+    });
     doc.apply(&transaction, view.id);
 
     match op {
@@ -2725,6 +2738,7 @@ pub fn command_palette(cx: &mut Context) {
                     register: None,
                     count: std::num::NonZeroUsize::new(1),
                     editor: cx.editor,
+                    registers: cx.registers,
                     callback: None,
                     on_next_key_callback: None,
                     jobs: cx.jobs,
@@ -3639,11 +3653,14 @@ fn yank(cx: &mut Context) {
         cx.register.unwrap_or('"')
     );
 
-    cx.editor
+    match cx
         .registers
-        .write(cx.register.unwrap_or('"'), values);
+        .write(cx.register.unwrap_or('"'), cx.editor, values)
+    {
+        Ok(_) => cx.editor.set_status(msg),
+        Err(err) => cx.editor.set_error(err.to_string()),
+    }
 
-    cx.editor.set_status(msg);
     exit_select_mode(cx);
 }
 
@@ -3882,10 +3899,10 @@ fn paste_primary_clipboard_before(cx: &mut Context) {
 fn replace_with_yanked(cx: &mut Context) {
     let count = cx.count();
     let reg_name = cx.register.unwrap_or('"');
-    let (view, doc) = current!(cx.editor);
-    let registers = &mut cx.editor.registers;
 
-    if let Some(values) = registers.read(reg_name) {
+    if let Some(values) = cx.registers.read(reg_name, cx.editor) {
+        let (view, doc) = current!(cx.editor);
+
         if !values.is_empty() {
             let repeat = std::iter::repeat(
                 values
@@ -3951,11 +3968,11 @@ fn replace_selections_with_primary_clipboard(cx: &mut Context) {
 fn paste(cx: &mut Context, pos: Paste) {
     let count = cx.count();
     let reg_name = cx.register.unwrap_or('"');
-    let (view, doc) = current!(cx.editor);
-    let registers = &mut cx.editor.registers;
 
-    if let Some(values) = registers.read(reg_name) {
-        paste_impl(values, doc, view, pos, count, cx.editor.mode);
+    if let Some(values) = cx.registers.read(reg_name, cx.editor) {
+        let (view, doc) = current!(cx.editor);
+
+        paste_impl(&values, doc, view, pos, count, cx.editor.mode);
     }
 }
 
@@ -4696,7 +4713,7 @@ fn wonly(cx: &mut Context) {
 }
 
 fn select_register(cx: &mut Context) {
-    cx.editor.autoinfo = Some(Info::from_registers(&cx.editor.registers));
+    cx.editor.autoinfo = Some(Info::from_registers(cx.registers));
     cx.on_next_key(move |cx, event| {
         if let Some(ch) = event.char() {
             cx.editor.autoinfo = None;
@@ -4706,7 +4723,7 @@ fn select_register(cx: &mut Context) {
 }
 
 fn insert_register(cx: &mut Context) {
-    cx.editor.autoinfo = Some(Info::from_registers(&cx.editor.registers));
+    cx.editor.autoinfo = Some(Info::from_registers(cx.registers));
     cx.on_next_key(move |cx, event| {
         if let Some(ch) = event.char() {
             cx.editor.autoinfo = None;
@@ -5419,9 +5436,12 @@ fn record_macro(cx: &mut Context) {
                 }
             })
             .collect::<String>();
-        cx.editor.registers.write(reg, vec![s]);
-        cx.editor
-            .set_status(format!("Recorded to register [{}]", reg));
+        match cx.registers.write(reg, cx.editor, vec![s]) {
+            Ok(_) => cx
+                .editor
+                .set_status(format!("Recorded to register [{}]", reg)),
+            Err(err) => cx.editor.set_error(err.to_string()),
+        }
     } else {
         let reg = cx.register.take().unwrap_or('@');
         cx.editor.macro_recording = Some((reg, Vec::new()));
@@ -5441,8 +5461,13 @@ fn replay_macro(cx: &mut Context) {
         return;
     }
 
-    let keys: Vec<KeyEvent> = if let Some([keys_str]) = cx.editor.registers.read(reg) {
-        match helix_view::input::parse_macro(keys_str) {
+    let keys: Vec<KeyEvent> = if let Some(keys_str) = cx
+        .registers
+        .read(reg, cx.editor)
+        .filter(|values| values.len() == 1)
+        .map(|values| values[0].clone())
+    {
+        match helix_view::input::parse_macro(&keys_str) {
             Ok(keys) => keys,
             Err(err) => {
                 cx.editor.set_error(format!("Invalid macro: {}", err));
